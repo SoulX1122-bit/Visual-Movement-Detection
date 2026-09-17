@@ -29,7 +29,6 @@ from collections import deque
 import csv
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-import math
 from pathlib import Path
 import queue
 import threading
@@ -38,12 +37,6 @@ import time
 import cv2
 import mediapipe as mp
 import numpy as np
-
-# pyserial is only imported inside EmgReceiver's real-hardware path (see
-# EmgReceiver._run_serial), not here at module load -- EMG_DEMO_MODE = True
-# must keep working even on a machine where pyserial isn't installed, since
-# that is the expected state until the ESP32 hardware exists.
-
 
 # -----------------------------------------------------------------------------
 # Calibration and detector settings
@@ -121,9 +114,8 @@ MIN_VISIBILITY = 0.50
 # Do not divide by a very small body reference distance.
 MIN_BODY_SCALE = 0.05
 
-# Maximum number of people MediaPipe will detect and track at once. Raising
-# this costs real per-frame compute -- expect a lower frame rate as it goes up.
-MAX_PEOPLE = 4
+# Maximum number of people MediaPipe will detect and track at once.
+MAX_PEOPLE = 2
 
 # How far (as a multiple of that person's own body scale) a detected pose's
 # centroid may have moved since the previous frame and still count as the
@@ -148,13 +140,6 @@ LANDMARK_SMOOTHING_ALPHA = 0.5
 # EMG + joystick settings
 # -----------------------------------------------------------------------------
 #
-# No ESP32 hardware exists yet, so EMG_DEMO_MODE drives a synthetic signal
-# generator instead of a real serial connection (see EmgReceiver). Flipping
-# it to False once hardware is available is the only change needed -- the
-# receiver thread, the CSV logging, and every panel drawn from its data are
-# written against the same row shape regardless of where the rows come from.
-EMG_DEMO_MODE = True
-
 # None = auto-detect by scanning available serial ports (same behavior as
 # the original standalone script); set to e.g. "COM4" to force one.
 EMG_SERIAL_PORT = None
@@ -1145,31 +1130,6 @@ def parse_emg_line(line: str):
     }
 
 
-def generate_demo_emg_row(sample_count: int, elapsed_seconds: float) -> dict:
-    """Synthetic row matching the real device's exact shape, so every
-    downstream consumer (state tracking, drawing, CSV logging) works
-    identically whether EMG_DEMO_MODE is on or a real device is connected.
-    """
-    emg1 = [
-        int(300 + 100 * math.sin(sample_count / 8 + i * 0.6))
-        for i in range(EMG_SAMPLES_PER_ROW)
-    ]
-    emg2 = [
-        int(300 + 100 * math.cos(sample_count / 8 + i * 0.6))
-        for i in range(EMG_SAMPLES_PER_ROW)
-    ]
-
-    return {
-        "seq": sample_count,
-        "device_timestamp_ms": int(elapsed_seconds * 1000),
-        "emg1": emg1,
-        "emg2": emg2,
-        "joy_x": int(2048 + 500 * math.sin(sample_count / 20)),
-        "joy_y": int(2048 + 400 * math.cos(sample_count / 25)),
-        "btn": 1 if sample_count % 200 == 0 else 0,
-    }
-
-
 def compute_rms(values) -> float:
     """RMS of the AC-varying component of a batch of raw samples (the
     batch's own mean is subtracted first). Plain RMS of the raw values
@@ -1188,13 +1148,8 @@ def compute_rms(values) -> float:
 
 
 class EmgReceiver:
-    """Reads EMG + joystick rows on a background thread so the ~30 fps
+    """Reads real EMG + joystick rows on a background thread so the ~30 fps
     video loop never blocks waiting on a slow or serial-timeout read.
-
-    The thread's only job is "produce rows into a queue" -- it does not
-    know or care whether EMG_DEMO_MODE is on, so the main loop's draining
-    code (see main()) is identical either way. That is what makes swapping
-    in real hardware later a one-constant change instead of a rewrite.
 
     Each row is stamped with pc_timestamp_seconds at the moment it is
     actually received, measured from the same start_time origin as the
@@ -1207,19 +1162,24 @@ class EmgReceiver:
 
     def __init__(
         self,
-        demo_mode: bool,
         port,
         baud_rate: int,
         start_time: float,
     ) -> None:
-        self.demo_mode = demo_mode
         self.port = port
         self.baud_rate = baud_rate
         self.start_time = start_time
 
         self.row_queue: queue.Queue = queue.Queue()
+        # `connected` means valid EMG data is arriving, not merely that a
+        # serial port happened to open successfully.
         self.connected = False
+        self.port_open = False
+        self.connected_port: str | None = None
         self.connection_error: str | None = None
+        self.received_row_count = 0
+        self.last_data_seconds: float | None = None
+        self.last_data_monotonic: float | None = None
 
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -1247,81 +1207,91 @@ class EmgReceiver:
         return rows
 
     def _run(self) -> None:
-        if self.demo_mode:
-            self._run_demo()
-        else:
-            self._run_serial()
-
-    def _run_demo(self) -> None:
-        self.connected = True
-        sample_count = 0
-
-        while not self._stop_event.is_set():
-            elapsed_seconds = time.perf_counter() - self.start_time
-            row = generate_demo_emg_row(sample_count, elapsed_seconds)
-            row["pc_timestamp_seconds"] = elapsed_seconds
-            self.row_queue.put(row)
-            sample_count += EMG_SAMPLES_PER_ROW
-
-            # Matches the original standalone script's demo cadence: ~20
-            # rows/sec, each carrying EMG_SAMPLES_PER_ROW samples.
-            time.sleep(0.05)
+        self._run_serial()
 
     def _run_serial(self) -> None:
-        # Imported here, not at module load, so EMG_DEMO_MODE = True keeps
-        # working even where pyserial isn't installed.
-        import serial
-        import serial.tools.list_ports
-
-        candidates = (
-            [self.port]
-            if self.port
-            else [device.device for device in serial.tools.list_ports.comports()]
-        )
-
-        if not candidates:
-            self.connection_error = "No serial ports detected."
-            return
-
-        connection = None
-        last_error = None
-
-        for port_name in candidates:
-            try:
-                connection = serial.Serial(
-                    port_name, self.baud_rate, timeout=0.1
-                )
-                break
-            except serial.SerialException as exc:
-                last_error = exc
-
-        if connection is None:
+        try:
+            import serial
+            import serial.tools.list_ports
+        except ImportError:
             self.connection_error = (
-                f"Could not open any serial port ({last_error}). "
-                "Check that nothing else (a serial monitor, another "
-                "script) already has it open, and that the device is "
-                "plugged in."
+                "pyserial is not installed. Run: pip install pyserial"
             )
             return
 
-        self.connected = True
+        while not self._stop_event.is_set():
+            available_ports = [
+                device.device for device in serial.tools.list_ports.comports()
+            ]
+            # Auto-detect still supports every listed port, but tries the
+            # common ESP32 assignments COM3/COM4 first when they exist.
+            available_ports.sort(
+                key=lambda name: (name.upper() not in {"COM3", "COM4"}, name)
+            )
+            candidates = [self.port] if self.port else available_ports
 
-        try:
-            while not self._stop_event.is_set():
-                line = connection.readline()
+            if not candidates:
+                self.connection_error = "COM NOT CONNECTED: no serial ports found."
+                self._stop_event.wait(2.0)
+                continue
 
-                if not line:
-                    continue
+            connection = None
+            last_error = None
 
-                elapsed_seconds = time.perf_counter() - self.start_time
-                row = parse_emg_line(line.decode("utf-8", errors="ignore"))
+            for port_name in candidates:
+                try:
+                    connection = serial.Serial(
+                        port_name, self.baud_rate, timeout=0.1
+                    )
+                    self.connected_port = port_name
+                    self.port_open = True
+                    self.connection_error = None
+                    break
+                except serial.SerialException as exc:
+                    last_error = exc
 
-                if row is not None:
-                    row["pc_timestamp_seconds"] = elapsed_seconds
-                    self.row_queue.put(row)
-        finally:
-            connection.close()
-            self.connected = False
+            if connection is None:
+                requested_ports = ", ".join(candidates)
+                self.connection_error = (
+                    f"COM NOT CONNECTED: could not open {requested_ports} "
+                    f"({last_error})."
+                )
+                self._stop_event.wait(2.0)
+                continue
+
+            try:
+                while not self._stop_event.is_set():
+                    line = connection.readline()
+
+                    if not line:
+                        continue
+
+                    elapsed_seconds = time.perf_counter() - self.start_time
+                    row = parse_emg_line(line.decode("utf-8", errors="ignore"))
+
+                    # Only correctly formed device rows reach the state or
+                    # plots. Random serial text and malformed packets cannot
+                    # create fake EMG traces.
+                    if row is not None:
+                        row["pc_timestamp_seconds"] = elapsed_seconds
+                        self.row_queue.put(row)
+                        self.received_row_count += 1
+                        self.last_data_seconds = elapsed_seconds
+                        self.last_data_monotonic = time.perf_counter()
+                        self.connected = True
+            except serial.SerialException as exc:
+                self.connection_error = (
+                    f"COM NOT CONNECTED: {self.connected_port} disconnected "
+                    f"({exc})."
+                )
+            finally:
+                connection.close()
+                self.port_open = False
+                self.connected = False
+
+            # Keep trying so reconnecting an ESP32 does not require restarting.
+            if not self._stop_event.is_set():
+                self._stop_event.wait(1.0)
 
 
 @dataclass
@@ -1436,8 +1406,6 @@ class MovementCsvLogger:
 
         self.writer.writeheader()
         self.file.flush()
-
-        self.recording = False
 
     @staticmethod
     def _fieldnames() -> list[str]:
@@ -1566,8 +1534,6 @@ class EmgCsvLogger:
         )
         self.writer.writerow(header)
         self.file.flush()
-
-        self.recording = False
 
     def write_row(self, timestamp_ms: int, row: dict) -> None:
         """Write one row. timestamp_ms is this program's own PC-side clock
@@ -1807,6 +1773,41 @@ def draw_datetime_label(frame, current_datetime: datetime) -> None:
     )
 
 
+def draw_emg_status_indicator(frame, receiver: EmgReceiver | None) -> None:
+    """Show the real COM/data state below the date/time label."""
+    if receiver is None:
+        return
+
+    if receiver.connection_error:
+        text, color = "COM NOT CONNECTED", (0, 0, 255)
+    elif not receiver.port_open:
+        text, color = "COM NOT CONNECTED", (0, 0, 255)
+    elif receiver.received_row_count == 0:
+        text, color = f"{receiver.connected_port}: WAITING FOR DATA", (0, 165, 255)
+    elif (
+        receiver.last_data_monotonic is None
+        or time.perf_counter() - receiver.last_data_monotonic > 2.0
+    ):
+        text, color = f"{receiver.connected_port}: DATA STOPPED", (0, 0, 255)
+    else:
+        text, color = (
+            f"{receiver.connected_port}: RECEIVING DATA "
+            f"({receiver.received_row_count} rows)",
+            (0, 255, 0),
+        )
+
+    height, width = frame.shape[:2]
+    (text_width, text_height), _ = cv2.getTextSize(
+        text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1,
+    )
+    x = width - text_width - 15
+    y = text_height + 42
+    cv2.rectangle(frame, (x - 7, y - text_height - 6), (width - 8, y + 6), (0, 0, 0), -1)
+    cv2.putText(
+        frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA,
+    )
+
+
 # The plot's x-axis covers the whole session, from 0:00 at the moment
 # recording started to the current elapsed time -- not a fixed-width
 # rolling window. It grows as the session goes on rather than scrolling,
@@ -1827,7 +1828,7 @@ PLOT_TICK_COUNT = 5
 # after that fix -- it does not need re-deriving alongside it.
 PLOT_Y_MAX = 0.25
 
-PLOT_PANEL_WIDTH = 480
+PLOT_PANEL_WIDTH = 440
 PLOT_MARGIN_LEFT = 55
 PLOT_MARGIN_RIGHT = 15
 PLOT_MARGIN_TOP = 20
@@ -2027,15 +2028,21 @@ def draw_time_series_panel(
         for start_point, end_point in zip(pixel_points, pixel_points[1:]):
             cv2.line(panel, start_point, end_point, color, 2, cv2.LINE_AA)
 
+        (label_width, _), _ = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1,
+        )
+        legend_width = 18 + 5 + label_width
+        legend_x = panel_width - legend_width - 8
+
         cv2.line(
             panel,
-            (panel_width - 130, legend_y),
-            (panel_width - 112, legend_y),
+            (legend_x, legend_y),
+            (legend_x + 18, legend_y),
             color,
             2,
         )
         cv2.putText(
-            panel, label, (panel_width - 108, legend_y + 4),
+            panel, label, (legend_x + 23, legend_y + 4),
             cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1, cv2.LINE_AA,
         )
         legend_y += 15
@@ -2096,8 +2103,8 @@ def draw_emg_envelope_panel(
     y_min = min(y_min, 0.0)  # RMS is non-negative; always show the 0 baseline.
 
     series = [
-        ("EMG 1 (RMS)", _PLOT_LINE_COLOR_CYCLE[0], list(emg_state.emg1_envelope)),
-        ("EMG 2 (RMS)", _PLOT_LINE_COLOR_CYCLE[1], list(emg_state.emg2_envelope)),
+        ("EMG 1 RMS", _PLOT_LINE_COLOR_CYCLE[0], list(emg_state.emg1_envelope)),
+        ("EMG 2 RMS", _PLOT_LINE_COLOR_CYCLE[1], list(emg_state.emg2_envelope)),
     ]
 
     return draw_time_series_panel(
@@ -2147,6 +2154,55 @@ def draw_emg_raw_panel(panel_height: int, emg_state: EmgState) -> np.ndarray:
     )
 
 
+def draw_emg_channel_panel(
+    panel_height: int,
+    sample_count: int,
+    samples: deque,
+    label: str,
+    color: tuple[int, int, int],
+) -> np.ndarray:
+    """Draw one received EMG channel as a rolling raw waveform."""
+    x_max = max(sample_count, EMG_WINDOW_SAMPLES)
+    x_min = x_max - EMG_WINDOW_SAMPLES
+    values = list(samples)
+    y_min, y_max = auto_range(values)
+
+    return draw_time_series_panel(
+        panel_width=PLOT_PANEL_WIDTH,
+        panel_height=panel_height,
+        series=[(label, color, indexed_samples(sample_count, samples))],
+        x_min=x_min,
+        x_max=x_max,
+        y_min=y_min,
+        y_max=y_max,
+        format_x_label=lambda value: f"{int(value)}",
+    )
+
+
+def draw_live_emg_monitor(emg_state: EmgState, panel_height: int) -> np.ndarray:
+    """Show raw EMG 1, raw EMG 2, and joystick data from real COM rows."""
+    emg1_height = panel_height // 3
+    emg2_height = panel_height // 3
+    joystick_height = panel_height - emg1_height - emg2_height
+
+    emg1_panel = draw_emg_channel_panel(
+        emg1_height,
+        emg_state.sample_count,
+        emg_state.emg1_raw,
+        "EMG 1 raw",
+        _PLOT_LINE_COLOR_CYCLE[0],
+    )
+    emg2_panel = draw_emg_channel_panel(
+        emg2_height,
+        emg_state.sample_count,
+        emg_state.emg2_raw,
+        "EMG 2 raw",
+        _PLOT_LINE_COLOR_CYCLE[1],
+    )
+    joystick_panel = draw_joystick_panel(joystick_height, emg_state)
+    return np.vstack((emg1_panel, emg2_panel, joystick_panel))
+
+
 def draw_joystick_panel(panel_height: int, emg_state: EmgState) -> np.ndarray:
     """Joystick X/Y and button, most recent EMG_WINDOW_SAMPLES rows --
     same sliding-window idea as draw_emg_raw_panel, but indexed by
@@ -2187,8 +2243,63 @@ def draw_joystick_panel(panel_height: int, emg_state: EmgState) -> np.ndarray:
 # Main program
 # -----------------------------------------------------------------------------
 
+def choose_capture_mode() -> tuple[bool, str | None, int]:
+    """Show clickable startup buttons for visual-only or visual + EMG mode."""
+    window_name = "Choose Capture Mode"
+    canvas = np.zeros((420, 820, 3), dtype=np.uint8)
+    selection = {"use_emg": None}
+    visual_button = (80, 180, 740, 255)
+    emg_button = (80, 285, 740, 360)
+
+    def select_mode(event, x, y, _flags, _userdata) -> None:
+        if event != cv2.EVENT_LBUTTONUP:
+            return
+
+        if visual_button[0] <= x <= visual_button[2] and visual_button[1] <= y <= visual_button[3]:
+            selection["use_emg"] = False
+        elif emg_button[0] <= x <= emg_button[2] and emg_button[1] <= y <= emg_button[3]:
+            selection["use_emg"] = True
+
+    cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
+    cv2.setMouseCallback(window_name, select_mode)
+
+    while selection["use_emg"] is None:
+        canvas[:] = (28, 28, 28)
+        cv2.putText(canvas, "Body Movement Detection", (145, 65), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(canvas, "Choose how you want to run this session", (185, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (190, 190, 190), 1, cv2.LINE_AA)
+        cv2.rectangle(canvas, visual_button[:2], visual_button[2:], (54, 123, 54), -1)
+        cv2.rectangle(canvas, emg_button[:2], emg_button[2:], (120, 72, 35), -1)
+        cv2.putText(canvas, "Visual Motion Only", (265, 226), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(canvas, "Visual Motion + EMG Hardware", (175, 331), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(canvas, "Press Esc to exit", (320, 400), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1, cv2.LINE_AA)
+        cv2.imshow(window_name, canvas)
+
+        if cv2.waitKey(20) & 0xFF == 27:
+            cv2.destroyWindow(window_name)
+            raise SystemExit("Cancelled before starting capture.")
+
+    cv2.destroyWindow(window_name)
+
+    if not selection["use_emg"]:
+        return False, None, EMG_BAUD_RATE
+
+    port = input(
+        "Serial port (for example COM4; press Enter to auto-detect): "
+    ).strip() or None
+    baud_text = input(f"Baud rate [{EMG_BAUD_RATE}]: ").strip()
+
+    try:
+        baud_rate = int(baud_text) if baud_text else EMG_BAUD_RATE
+    except ValueError:
+        print(f"Invalid baud rate; using {EMG_BAUD_RATE}.")
+        baud_rate = EMG_BAUD_RATE
+
+    return True, port, baud_rate
+
+
 def main() -> None:
     project_directory = Path(__file__).resolve().parent
+    use_emg, emg_port, emg_baud_rate = choose_capture_mode()
 
     model_path = (
         project_directory
@@ -2216,27 +2327,13 @@ def main() -> None:
 
     track_manager = PersonTrackManager()
 
-    # Shared by both CSV files so a movement_data_*.csv and an
-    # emg_data_*.csv from the same run are visibly paired by filename, on
-    # top of already sharing the same PC-side clock.
-    session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Loggers are deliberately created only when R starts recording. This
+    # prevents empty CSV files from appearing merely because the program ran.
+    csv_logger = None
+    emg_csv_logger = None
 
-    csv_logger = (
-        MovementCsvLogger(project_directory, session_timestamp)
-        if CALIBRATION_MODE
-        else None
-    )
-
-    emg_csv_logger = (
-        EmgCsvLogger(project_directory, session_timestamp)
-        if CALIBRATION_MODE
-        else None
-    )
-
-    if csv_logger is not None:
-        print(f"Movement CSV: {csv_logger.path}")
-        print(f"EMG CSV: {emg_csv_logger.path}")
-        print("R = record on/off (starts/stops both CSVs together)")
+    if CALIBRATION_MODE:
+        print("R = start/stop recording (CSV files are created when recording starts)")
         print("Tab = switch which tracked person you're labeling")
         print("0-9 = select trial for the active person")
         print("S = LYING_SIDEWAYS_STILL")
@@ -2252,20 +2349,18 @@ def main() -> None:
     start_datetime = datetime.now()
     frame_number = 0
 
-    emg_receiver = EmgReceiver(
-        EMG_DEMO_MODE, EMG_SERIAL_PORT, EMG_BAUD_RATE, start_time,
-    )
-    emg_receiver.start()
-    emg_state = EmgState()
+    emg_receiver = None
+    emg_state = EmgState() if use_emg else None
 
-    if EMG_DEMO_MODE:
-        print("EMG: running on synthetic demo data (EMG_DEMO_MODE = True).")
-    else:
+    if use_emg:
+        emg_receiver = EmgReceiver(emg_port, emg_baud_rate, start_time)
+        emg_receiver.start()
         print(
             f"EMG: connecting to real hardware "
-            f"(port={EMG_SERIAL_PORT or 'auto-detect'}, "
-            f"baud={EMG_BAUD_RATE})..."
+            f"(port={emg_port or 'auto-detect'}, baud={emg_baud_rate})..."
         )
+    else:
+        print("EMG: disabled (visual motion only).")
 
     print(
         f"Camera started. Tracking up to {MAX_PEOPLE} people. "
@@ -2361,7 +2456,7 @@ def main() -> None:
                         track.region_trackers,
                     )
 
-                    if csv_logger is not None and csv_logger.recording:
+                    if csv_logger is not None:
                         overall_state = get_overall_state(track.region_trackers)
 
                         csv_logger.write_frame(
@@ -2374,19 +2469,17 @@ def main() -> None:
                             overall_state,
                         )
 
-                # Drain and process any EMG/joystick rows received since
-                # the last frame. Rows arrive on their own thread (see
-                # EmgReceiver) at their own pace -- draining just means
-                # "however many are waiting right now," which may be zero,
-                # one, or several depending on how the two rates line up.
-                for emg_row in emg_receiver.drain():
-                    update_emg_state(emg_state, emg_row)
+                if emg_receiver is not None:
+                    # EMG rows arrive independently of video frames, so the
+                    # receiver is drained without blocking the camera loop.
+                    for emg_row in emg_receiver.drain():
+                        update_emg_state(emg_state, emg_row)
 
-                    if emg_csv_logger is not None and emg_csv_logger.recording:
-                        emg_csv_logger.write_row(
-                            int(emg_row["pc_timestamp_seconds"] * 1000),
-                            emg_row,
-                        )
+                        if emg_csv_logger is not None:
+                            emg_csv_logger.write_row(
+                                int(emg_row["pc_timestamp_seconds"] * 1000),
+                                emg_row,
+                            )
 
                 draw_movement_summary(frame, track_manager.tracks)
 
@@ -2394,22 +2487,20 @@ def main() -> None:
                     seconds=timestamp_ms / 1000
                 )
                 draw_datetime_label(frame, current_datetime)
+                draw_emg_status_indicator(frame, emg_receiver)
 
                 active_track = track_manager.tracks.get(
                     track_manager.active_track_id
                 )
 
-                # Right-side 2x2 grid, height-matched to the video frame so
-                # np.hstack/np.vstack can combine everything into one
-                # window: movement plot and EMG envelope on top (both
-                # whole-session, sharing the same time axis, meant to be
-                # read side by side), raw EMG waveform and joystick on the
-                # bottom (both short rolling sample windows).
+                # Keep the display focused: one movement plot, plus one EMG
+                # activation plot only when real EMG hardware is selected.
+                # Stacking the plots keeps the total window narrow enough for
+                # the full EMG legend to remain visible on typical screens.
                 top_panel_height = frame.shape[0] // 2
                 bottom_panel_height = frame.shape[0] - top_panel_height
-
                 movement_panel = draw_movement_plot(
-                    panel_height=top_panel_height,
+                    panel_height=(top_panel_height if emg_state is not None else frame.shape[0]),
                     plot_history=(
                         active_track.plot_history
                         if active_track is not None
@@ -2421,57 +2512,56 @@ def main() -> None:
                     current_time_seconds=timestamp_ms / 1000,
                 )
 
-                emg_envelope_panel = draw_emg_envelope_panel(
-                    panel_height=top_panel_height,
-                    emg_state=emg_state,
-                    current_time_seconds=timestamp_ms / 1000,
-                )
-
-                emg_raw_panel = draw_emg_raw_panel(
-                    panel_height=bottom_panel_height,
-                    emg_state=emg_state,
-                )
-
-                joystick_panel = draw_joystick_panel(
-                    panel_height=bottom_panel_height,
-                    emg_state=emg_state,
-                )
-
-                right_grid = np.vstack(
-                    (
-                        np.hstack((movement_panel, emg_envelope_panel)),
-                        np.hstack((emg_raw_panel, joystick_panel)),
+                if emg_state is not None:
+                    emg_panel = draw_emg_envelope_panel(
+                        panel_height=bottom_panel_height,
+                        emg_state=emg_state,
+                        current_time_seconds=timestamp_ms / 1000,
                     )
-                )
-
-                combined_display = np.hstack((frame, right_grid))
+                    combined_display = np.hstack(
+                        (frame, np.vstack((movement_panel, emg_panel)))
+                    )
+                else:
+                    combined_display = np.hstack((frame, movement_panel))
 
                 cv2.imshow(
                     "Body Movement Detection",
                     combined_display,
                 )
 
-                key = cv2.waitKey(1) & 0xFF
-
-                if (
-                    key in (ord("r"), ord("R"))
-                    and csv_logger is not None
-                ):
-                    # Movement and EMG logging start/stop together, on
-                    # purpose: the whole point is that the two CSVs cover
-                    # the same time range so they can be correlated
-                    # afterward. Two independent toggles would make it
-                    # easy to end up with mismatched ranges.
-                    csv_logger.recording = not csv_logger.recording
-                    emg_csv_logger.recording = csv_logger.recording
-
-                    status = (
-                        "ON"
-                        if csv_logger.recording
-                        else "OFF"
+                if emg_state is not None:
+                    cv2.imshow(
+                        "Live COM EMG + Joystick",
+                        draw_live_emg_monitor(emg_state, frame.shape[0]),
                     )
 
-                    print(f"Recording: {status}")
+                key = cv2.waitKey(1) & 0xFF
+
+                if key in (ord("r"), ord("R")) and CALIBRATION_MODE:
+                    if csv_logger is None:
+                        session_timestamp = datetime.now().strftime(
+                            "%Y%m%d_%H%M%S"
+                        )
+                        csv_logger = MovementCsvLogger(
+                            project_directory, session_timestamp
+                        )
+                        if use_emg:
+                            emg_csv_logger = EmgCsvLogger(
+                                project_directory, session_timestamp
+                            )
+
+                        print(f"Recording ON. Movement CSV: {csv_logger.path}")
+                        if emg_csv_logger is not None:
+                            print(f"EMG CSV: {emg_csv_logger.path}")
+                    else:
+                        csv_logger.close()
+                        csv_logger = None
+
+                        if emg_csv_logger is not None:
+                            emg_csv_logger.close()
+                            emg_csv_logger = None
+
+                        print("Recording OFF.")
 
                 elif key == 9:  # Tab
                     track_manager.cycle_active_track()
@@ -2498,7 +2588,8 @@ def main() -> None:
     finally:
         camera.release()
         cv2.destroyAllWindows()
-        emg_receiver.stop()
+        if emg_receiver is not None:
+            emg_receiver.stop()
 
         if csv_logger is not None:
             csv_logger.close()
